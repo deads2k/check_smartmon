@@ -32,10 +32,87 @@ __version__ = "$Revision$"
 
 
 # path to smartctl
-_smartctlPath = "/usr/sbin/smartctl"
+SMARTCTL_PATH = "/usr/sbin/smartctl"
 
 # application wide verbosity (can be adjusted with -v [0-3])
-_verbosity = 0
+VERBOSITY = 0
+
+NAGIOS_OK = 0
+NAGIOS_WARNING = 1
+NAGIOS_CRITICAL = 2
+
+class DeviceThreshold(object):
+    """DeviceThreshold contains status limits.  
+    It is logically paired to DriveInfo"""
+    warningTemperature = 55
+    criticalTemperature = 60
+    criticalReallocatedSectors = 0 # failures are bad
+    warningSpinRetryCount = 0 # I don't know a reasonable default
+    criticalSpinRetryCount = 0 # I don't know a reasonable default
+    warningReadFailureSectors = 0 # I don't know a reasonable default
+    criticalReadFailureSectors = 0 # I don't know a reasonable default
+
+class NagiosInfo(object):
+    status = NAGIOS_OK
+    message = ""
+
+class DeviceInfo(object):
+    """DeviceInfo contains SMART data about a drive"""
+    device = "" # name of the device
+    # initialize to failure status
+    temperature = 1000
+    reallocatedSectors = 1000 # sectors are reallocated when writes fail
+    spinRetryCount = 1000
+    readFailureSectors = 1000 # sectors where data couldn't be read.  Sometimes, subsequent reads are successful.  This is still bad
+    def __init__(self, device):
+        self.device = device
+
+    def parseSmartCtlOutput(self, output):
+        lines = output.split("\n")
+        for line in lines:
+            parts = line.split()
+            if len(parts):
+                # 194 is the temperature value id
+                if parts[0] == "194":
+                    self.temperature = int(parts[9])
+                # 5 is reallocated sectors
+                elif parts[0] == "5":
+                    self.reallocatedSectors = int(parts[9])
+                # 10 is spin retry
+                elif parts[0] == "10":
+                    self.spinRetryCount = int(parts[9])
+                # 197 is read failures
+                elif parts[0] == "197":
+                    self.readFailureSectors = int(parts[9])
+ 
+    def getNagiosInfo(self, driveThreshold):
+        nagiosInfo = NagiosInfo()
+
+        nagiosInfo.message += self.device + "("
+        compareSimpleStat(self.temperature, driveThreshold.warningTemperature, driveThreshold.criticalTemperature, "temperature", nagiosInfo)
+        nagiosInfo.message += ", "
+        compareSimpleStat(self.reallocatedSectors, driveThreshold.criticalReallocatedSectors, driveThreshold.criticalReallocatedSectors, "write-failures", nagiosInfo)
+        nagiosInfo.message += ", "
+        compareSimpleStat(self.spinRetryCount, driveThreshold.warningSpinRetryCount, driveThreshold.criticalSpinRetryCount, "spin-retry", nagiosInfo)
+        nagiosInfo.message += ", "
+        compareSimpleStat(self.readFailureSectors, driveThreshold.warningReadFailureSectors, driveThreshold.criticalReadFailureSectors, "read-failures", nagiosInfo)
+        nagiosInfo.message += ")"
+
+        return nagiosInfo
+
+
+def compareSimpleStat(stat, warningLevel, criticalLevel, statName, nagiosInfo):
+    if stat > criticalLevel:
+        nagiosInfo.status = max(nagiosInfo.status, NAGIOS_CRITICAL)
+        nagiosInfo.message += "CRITICAL-" + statName.upper() + ":"
+    elif stat > warningLevel:
+        nagiosInfo.status = max(nagiosInfo.status, NAGIOS_CRITICAL)
+        nagiosInfo.message += "WARNING-" + statName.upper() + ":"
+    else:
+        nagiosInfo.message += statName + ":"
+    nagiosInfo.message += str(stat)
+    nagiosInfo.message += " of (" + str(warningLevel) + "," + str(criticalLevel) + ")"
+
 
 
 def parseCmdLine(args):
@@ -48,7 +125,7 @@ def parseCmdLine(args):
 
     parser = OptionParser(usage=usage, version=version)
     parser.add_option("-d", "--device", action="store", dest="device",
-                      default="", metavar="DEVICE",
+                      default=None, metavar="DEVICE",
                       help="device to check")
     parser.add_option("-v", "--verbosity", action="store", dest="verbosity",
                       type="int", default=0, metavar="LEVEL",
@@ -68,7 +145,7 @@ def parseCmdLine(args):
     return parser.parse_args(args)
 
 
-def checkDevice(path):
+def checkDevice(device):
     """
     Check if device exists and permissions are ok.
     Returns:
@@ -76,11 +153,11 @@ def checkDevice(path):
         - 1 no such device
         - 2 no read permission given
     """
-
-    vprint(3, "Check if %s does exist and can be read" % path)
-    if not os.access(path, os.F_OK):
-        return 1, "UNKNOWN: no such device found"
-    elif not os.access(path, os.R_OK):
+    
+    vprint(3, "Check if %s does exist and can be read" % device)
+    if not os.access(device, os.F_OK):
+        return 1, "UNKNOWN: no such device found \"" + device + "\""
+    elif not os.access(device, os.R_OK):
         return 2, "UNKNOWN: no read permission given"
     else:
         return 0, ""
@@ -103,6 +180,19 @@ def checkSmartMonTools(path):
     else:
         return 0, ""
 
+def getDevices(path):
+    cmd = "%s --scan" % (path)
+    (child_stdin, child_stdout, child_stderr) = os.popen3(cmd)
+    line = child_stderr.readline()
+    if len(line):
+        return 3, "UNKNOWN: call exits unexpectedly (%s)" % line, "", ""
+
+    devices = []
+    for line in child_stdout:
+        parts = line.split()
+        devices.append(parts[0])
+
+    return devices
 
 def callSmartMonTools(path, device):
     # get health status
@@ -118,7 +208,7 @@ def callSmartMonTools(path, device):
 
     # get temperature
     cmd = "%s -A %s" % (path, device)
-    vprint(3, "Get device temperature: %s" % cmd)
+    vprint(3, "Read device SMART attributes: %s" % cmd)
     (child_stdin, child_stdout, child_stderr) = os.popen3(cmd)
     line = child_stderr.readline()
     if len(line):
@@ -131,10 +221,10 @@ def callSmartMonTools(path, device):
     return 0 ,"", healthStatusOutput, smartAttributeOutput
 
 
-def parseOutput(healthMessage, smartAttributeOutput):
+def parseOutput(healthMessage):
     """
     Parse smartctl output
-    Returns (health status, temperature).
+    Returns (health status).
     """
 
     # parse health status
@@ -153,26 +243,10 @@ def parseOutput(healthMessage, smartAttributeOutput):
     healthStatus = parts[-1]
     vprint(3, "Health status: %s" % healthStatus)
 
-    # parse temperature attribute line
-    temperature = 0
-    reallocatedSectors = 0
-    lines = smartAttributeOutput.split("\n")
-    for line in lines:
-        parts = line.split()
-        if len(parts):
-            # 194 is the temperature value id
-            if parts[0] == "194":
-                temperature = int(parts[9])
-            # 5 is reallocated sectors
-            elif parts[0] == "5":
-                reallocatedSectors = int(parts[9])
-    vprint(3, "Temperature: %d" %temperature)
-    vprint(3, "ReallocatedSectors: %d" %reallocatedSectors)
-
-    return (healthStatus, temperature, reallocatedSectors)
+    return (healthStatus)
 
 
-def createReturnInfo(healthStatus, temperature, reallocatedSectors, warningThreshold, criticalThreshold):
+def createReturnInfo(healthStatus, nagiosInfo):
     """
     Create return information according to given thresholds.
     """
@@ -181,16 +255,7 @@ def createReturnInfo(healthStatus, temperature, reallocatedSectors, warningThres
     if healthStatus != "PASSED":
         return 2, "CRITICAL: device does not pass health status"
 
-    if (reallocatedSectors > 0):
-        return 2, "CRITICAL: number of bad sectors (%d) exceeds warning threshold (%s)" % (reallocatedSectors, 0)
-
-    if temperature > criticalThreshold:
-        return 2, "CRITICAL: device temperature (%d) exceeds critical temperature threshold (%s)" % (temperature, criticalThreshold)
-    elif temperature > warningThreshold:
-        return 1, "WARNING: device temperature (%d) exceeds warning temperature threshold (%s)" % (temperature, warningThreshold)
-    else:
-        return 0, "OK: device is functional and stable (temperature: %d, reallocatedSectors: %d)" % (temperature, reallocatedSectors)
-
+    return nagiosInfo.status, nagiosInfo.message
 
 def exitWithMessage(value, message):
     """
@@ -209,41 +274,60 @@ def vprint(level, message):
     printed to stdout.
     """
 
-    if level <= verbosity:
+    if level <= VERBOSITY:
         print message
 
 
 if __name__ == "__main__":
     (options, args) = parseCmdLine(sys.argv)
-    verbosity = options.verbosity
+    VERBOSITY = options.verbosity
 
-    vprint(2, "Get device name")
-    device = options.device
-    vprint(1, "Device: %s" % device)
-
-    # check if we can access 'path'
-    vprint(2, "Check device")
-    (value, message) = checkDevice(device)
-    if value != 0:
-        exitWithMessage(3, message)
-    # fi
+    thresholds = DeviceThreshold()
+    thresholds.warningTemperature = options.warningThreshold
+    thresholds.criticalTemperature = options.criticalThreshold
 
     # check if we have smartctl available
-    (value, message) = checkSmartMonTools(_smartctlPath)
+    (value, message) = checkSmartMonTools(SMARTCTL_PATH)
     if value != 0:
         exitWithMessage(3, message)
     # fi
-    vprint(1, "Path to smartctl: %s" % _smartctlPath)
+    vprint(1, "Path to smartctl: %s" % SMARTCTL_PATH)
 
-    # call smartctl and parse output
-    vprint(2, "Call smartctl")
-    (value, message, healthStatusOutput, smartAttributeOutput) = callSmartMonTools(_smartctlPath, device)
-    if value != 0:
-        exitWithMessage(value, message)
-    vprint(2, "Parse smartctl output")
-    (healthStatus, temperature, reallocatedSectors) = parseOutput(healthStatusOutput, smartAttributeOutput)
-    vprint(2, "Generate return information")
-    (value, message) = createReturnInfo(healthStatus, temperature, reallocatedSectors, options.warningThreshold, options.criticalThreshold)
+    # either scan for all devices or set specified
+    devices =[]
+    if options.device is not None:
+        devices.append(options.device)
+    else:
+        devices = getDevices(SMARTCTL_PATH)
+
+    overallReturnValue = NAGIOS_OK
+    overallReturnMessage =""
+
+    for device in devices:
+        # check if we can access 'path'
+        vprint(2, "Check device")
+        (value, message) = checkDevice(device)
+        if value != 0:
+            exitWithMessage(3, message)
+
+        # call smartctl and parse output
+        vprint(2, "Call smartctl")
+        (value, message, healthStatusOutput, smartAttributeOutput) = callSmartMonTools(SMARTCTL_PATH, device)
+        if value != 0:
+            exitWithMessage(value, message)
+        vprint(2, "Parse smartctl output")
+        (healthStatus) = parseOutput(healthStatusOutput)
+
+        deviceInfo = DeviceInfo(device)
+        deviceInfo.parseSmartCtlOutput(smartAttributeOutput)
+        nagiosInfo = deviceInfo.getNagiosInfo(thresholds)
+        vprint(3, "SMART Output: %s" %nagiosInfo.message)
+
+        vprint(2, "Generate return information")
+        (currValue, currMessage) = createReturnInfo(healthStatus, nagiosInfo)
+        vprint(1, "%d, %s" % (currValue, currMessage))
+        overallReturnValue = max(overallReturnValue, currValue)
+        overallReturnMessage += currMessage + "\n"
 
     # exit program
-    exitWithMessage(value, message)
+    exitWithMessage(overallReturnValue, overallReturnMessage)
